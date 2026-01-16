@@ -169,12 +169,15 @@ export default function PracticeSessionPage() {
   const analyserRef = useRef<AnalyserNode | null>(null)
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const chunksRef = useRef<Blob[]>([])
   const orchestratorRef = useRef<OrchestratorAgent | null>(null)
   const observationIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const analysisIntervalRef = useRef<NodeJS.Timeout | null>(null)
 
   useEffect(() => {
     orchestratorRef.current = new OrchestratorAgent()
-    setLiveSignals(generateMockLiveSignals())
+    setLiveSignals(generateMockLiveSignals()) // Keep initial mock signals for UI shell
 
     // Check URL params for quick start
     const urlScenario = searchParams.get('scenario')
@@ -202,6 +205,12 @@ export default function PracticeSessionPage() {
     }
     if (observationIntervalRef.current) {
       clearInterval(observationIntervalRef.current)
+    }
+    if (analysisIntervalRef.current) {
+      clearInterval(analysisIntervalRef.current)
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop()
     }
   }
 
@@ -234,18 +243,31 @@ export default function PracticeSessionPage() {
       })
 
       mediaStreamRef.current = stream
-
+      chunksRef.current = []
 
       if (cameraEnabled && videoRef.current) {
         videoRef.current.srcObject = stream
       }
 
-      // Audio Setup
+      // Audio Setup for visualization (optional)
       audioContextRef.current = new AudioContext()
       const source = audioContextRef.current.createMediaStreamSource(stream)
       analyserRef.current = audioContextRef.current.createAnalyser()
       analyserRef.current.fftSize = 2048
       source.connect(analyserRef.current)
+
+      // MediaRecorder Setup for Agent Pipeline
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' })
+      mediaRecorderRef.current = mediaRecorder
+
+      mediaRecorder.ondataavailable = async (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data)
+        }
+      }
+
+      // Start recording and firing dataavailable event every 2 seconds
+      mediaRecorder.start(2000)
 
       // Start Session in Store
       startSession(selectedMode || 'conversation', selectedScenario?.title)
@@ -259,7 +281,7 @@ export default function PracticeSessionPage() {
       // Start Analysis Loop
       analyzeAudio()
 
-      // Start Event Simulators
+      // Start Simulators
       startSimulators()
 
     } catch (error) {
@@ -269,36 +291,83 @@ export default function PracticeSessionPage() {
   }
 
   const analyzeAudio = () => {
-    if (!analyserRef.current || !orchestratorRef.current || !isRecording || isPaused) return
-
-    const bufferLength = analyserRef.current.frequencyBinCount
-    const dataArray = new Float32Array(bufferLength)
-    analyserRef.current.getFloatTimeDomainData(dataArray)
-
-    orchestratorRef.current.processAudio(dataArray, selectedMode || 'conversation').then((results) => {
-      const speechResult = results.find(r => r.agent === 'speech-signal')
-      const fluencyResult = results.find(r => r.agent === 'fluency')
-
-      if (speechResult) {
-        updateSessionMetrics({
-          stress: [speechResult.data.stress],
-          pitch: [speechResult.data.pitch],
-          volume: [speechResult.data.volume],
-          pace: [speechResult.data.pace],
-          fillerWords: [speechResult.data.fillerWords],
-        })
-        setCurrentMetrics(speechResult.data)
-      }
-
-      if (fluencyResult && fluencyResult.data.reassurance) {
-        setReassurance(fluencyResult.data.reassurance)
-      }
-
-      if (isRecording && !isPaused) {
-        requestAnimationFrame(analyzeAudio)
-      }
-    })
+    // Legacy function, logic relocated to useEffect for polling
   }
+
+  // Use Effect to drive the analysis loop
+  useEffect(() => {
+    if (isRecording && !isPaused) {
+      analysisIntervalRef.current = setInterval(async () => {
+        if (!analyserRef.current) return
+        const bufferLength = analyserRef.current.fftSize
+        const dataArray = new Float32Array(bufferLength)
+        analyserRef.current.getFloatTimeDomainData(dataArray)
+
+        // Convert to simple array for JSON
+        const audioData = Array.from(dataArray)
+
+        try {
+          const dspResponse = await fetch('/api/dsp', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              audio_data: audioData,
+              sample_rate: audioContextRef.current?.sampleRate || 16000
+            })
+          })
+
+          if (dspResponse.ok) {
+            const metrics = await dspResponse.json()
+
+            // Update State safely
+            setCurrentMetrics({
+              stress: metrics.stress_index,
+              pitch: metrics.pitch,
+              volume: metrics.volume,
+              pace: metrics.speaking_pace,
+              fillerWords: 0
+            })
+
+            // Update Live Signal Bar
+            setLiveSignals([
+              {
+                name: 'Pace',
+                value: metrics.speaking_pace,
+                max: 200,
+                color: metrics.speaking_pace > 160 ? '#EF4444' : '#10B981',
+                tooltip: 'Words per minute',
+                status: metrics.speaking_pace > 160 ? 'high' : 'normal'
+              },
+              {
+                name: 'Stress',
+                value: metrics.stress_index * 100,
+                max: 100,
+                color: metrics.stress_index > 0.7 ? '#EF4444' : '#10B981',
+                tooltip: 'Voice stress analysis',
+                status: metrics.stress_index > 0.7 ? 'elevated' : 'normal'
+              },
+              {
+                name: 'Volume',
+                value: metrics.volume * 100,
+                max: 100,
+                color: metrics.volume < 0.2 ? '#F59E0B' : '#10B981',
+                tooltip: 'Speaking volume',
+                status: 'normal'
+              }
+            ])
+          }
+        } catch (e) {
+          console.error("Realtime DSP Error", e)
+        }
+      }, 250) // Run every 250ms for 4Hz updates
+    } else {
+      if (analysisIntervalRef.current) clearInterval(analysisIntervalRef.current)
+    }
+
+    return () => {
+      if (analysisIntervalRef.current) clearInterval(analysisIntervalRef.current)
+    }
+  }, [isRecording, isPaused])
 
   const startSimulators = () => {
     // 1. Observations Simulator
@@ -310,7 +379,6 @@ export default function PracticeSessionPage() {
         type: ['pace', 'stress', 'general', 'volume'][Math.floor(Math.random() * 4)] as any,
         suggestion: Math.random() > 0.7 ? 'Keep it up!' : undefined,
       }
-      setLiveObservations(prev => [newObservation, ...prev].slice(0, 5))
       setLiveObservations(prev => [newObservation, ...prev].slice(0, 5))
     }, 5000)
 
@@ -333,11 +401,30 @@ export default function PracticeSessionPage() {
     }
   }
 
-  const stopRecording = () => {
+  const stopRecording = async () => {
     cleanup()
     setIsRecording(false)
     setIsPaused(false)
     const endedSession = endSession()
+
+    // 2. Call Agent 1 (Orchestrator) with full session data
+    if (chunksRef.current.length > 0) {
+      const fullBlob = new Blob(chunksRef.current, { type: 'audio/webm' })
+      const formData = new FormData()
+      formData.append('query', `Analyze this session for ${selectedMode || 'general'} mode.`)
+      formData.append('file', fullBlob)
+      formData.append('fileName', `session_${Date.now()}.webm`)
+      formData.append('sessionId', endedSession?.id || 'unknown')
+
+      try {
+        fetch('/api/agent', {
+          method: 'POST',
+          body: formData
+        }).catch(err => console.error("Agent 1 Upload Error:", err))
+      } catch (e) {
+        console.error("Error prepping Agent 1 upload", e)
+      }
+    }
 
     if (endedSession) {
       router.push(`/dashboard/insights?session=${endedSession.id}`)
@@ -545,7 +632,7 @@ export default function PracticeSessionPage() {
 
           <div className="bg-white p-4 rounded-lg shadow-sm border border-gray-200 flex justify-center gap-4">
             {isPaused ? (
-              <button onClick={() => { setIsPaused(false); analyzeAudio() }} className="bg-green-600 text-white px-8 py-3 rounded-lg font-semibold hover:bg-green-700 flex items-center gap-2">
+              <button onClick={() => { setIsPaused(false) }} className="bg-green-600 text-white px-8 py-3 rounded-lg font-semibold hover:bg-green-700 flex items-center gap-2">
                 <Play className="w-5 h-5" /> Resume
               </button>
             ) : (
